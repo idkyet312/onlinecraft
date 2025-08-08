@@ -90,8 +90,9 @@
       drawTile(TILE_GRASS_TOP, (c)=>{ fill(c, '#63e16c'); noise(c, TILE, TILE, 10); });
       drawTile(TILE_GRASS_SIDE,(c)=>{
         // Dirt body with a thin green stripe at the top
-        fill(c, '#8d6e63');
-        c.fillStyle = '#8d6e63';
+        fill(c, '#63e16c');
+        // Green stripe cap
+        c.fillStyle = '#63e16c';
         c.fillRect(0, 0, TILE, Math.max(3, Math.floor(TILE*0.12)));
         noise(c, TILE, TILE, 12);
       });
@@ -213,7 +214,9 @@
           default: return TILE_DIRT;
         }
       }
-      function getFaceUV(ix){ return tileUV(ix); }
+  function getFaceUV(ix){ return tileUV(ix); }
+  // For side faces we want the V direction to map such that v1 corresponds to the physical top edge,
+  // ensuring the green stripe sits at the top. We'll derive per-face UVs accordingly in pushFace.
 
       function buildChunkMesh(cx,cz){
         const startX = cx*CHUNK_SIZE;
@@ -224,17 +227,12 @@
         const positions=[]; const normals=[]; const uvs=[]; const indices=[];
         let indexOffset=0;
         function uvRectFromTile(ix){ const v = getFaceUV(ix); return {x:v.x, y:v.y, z:v.z, w:v.w}; }
-        function pushFace(wx,wy,wz, face){
+  function pushFace(wx,wy,wz, face){
           // wx,wy,wz are block centers in world coords
           const half=0.5;
           let a,b,c,d,nrm,uvRect;
           const t = getBlock(wx,wy,wz);
           uvRect = uvRectFromTile(tileForFace(t, face));
-          // Ensure grass uses top/bottom tiles correctly even if face id mismatches
-          if (t === BlockType.grass && (face===4 || face===5)) {
-            const isTop = (nrm && nrm[1] > 0);
-            uvRect = uvRectFromTile(isTop ? TILE_GRASS_TOP : TILE_DIRT);
-          }
           switch(face){
             case 2: // right +X
               nrm=[1,0,0];
@@ -281,9 +279,23 @@
           }
           positions.push(...a,...b,...c,...d);
           for(let i=0;i<4;i++){ normals.push(nrm[0],nrm[1],nrm[2]); }
+          // Compute UVs per face to keep stripe at physical top for sides
           const [u0,v0,u1,v1] = [uvRect.x, uvRect.y, uvRect.z, uvRect.w];
-          // Match vertex order per face so grass stripe sits at the top edge of the side quads
-          uvs.push(u0,v1, u1,v1, u1,v0, u0,v0);
+          switch(face){
+            case 2: // right +X, top edge is vertex d->c
+            case 3: // left -X,  top edge is vertex c->d
+            case 0: // front +Z, top edge is vertex b->c
+            case 1: // back  -Z, top edge is vertex b->c
+              // Map so vertices a,b,c,d correspond to bottom-left, top-left, top-right, bottom-right in UV
+              uvs.push(u0,v0, u0,v1, u1,v1, u1,v0);
+              break;
+            case 4: // top +Y uses normal mapping
+              uvs.push(u0,v1, u1,v1, u1,v0, u0,v0);
+              break;
+            case 5: // bottom -Y, flip V to avoid upside-down look
+              uvs.push(u0,v0, u1,v0, u1,v1, u0,v1);
+              break;
+          }
           indices.push(indexOffset, indexOffset+1, indexOffset+2, indexOffset, indexOffset+2, indexOffset+3);
           indexOffset+=4;
         }
@@ -401,7 +413,7 @@
 
       // Water plane at sea level using WaterMaterial (waves/refraction)
       const water = BABYLON.MeshBuilder.CreateGround('water', { width: 300, height: 300 }, scene);
-      water.position.y = SEA_LVL + 0.5;
+      water.position.y = SEA_LVL + 5;
       let waterMat;
       try {
         waterMat = new BABYLON.WaterMaterial('mWater', scene, new BABYLON.Vector2(512,512));
@@ -427,7 +439,7 @@
         const sx = clamp(Math.floor(cx), 0, SIZE_X-1);
         const sz = clamp(Math.floor(cz), 0, SIZE_Z-1);
         const sy = heights[sx][sz] + 2;
-        return new BABYLON.Vector3(sx + 0.5, sy, sz + 0.5);
+  return new BABYLON.Vector3(sx + 0.5, sy, sz + 5);
       }
   // Camera spawn will be set after world is generated/loaded
 
@@ -477,16 +489,47 @@
       // Ray picking for break/place
   let canFly = false;
       // Physics-based vertical motion
-      let vVel = 0; // vertical velocity (units/s)
-      const GRAVITY = -24; // units/s^2
-      const JUMP_SPEED = 6.5; // initial jump speed (units/s)
-      const GROUND_EPS = 0.15;
+      let vVel = 1; // vertical velocity (units/s)
+  const GRAVITY = -22; // units/s^2
+  const JUMP_SPEED = 7.2; // initial jump speed
+  const GROUND_EPS = 0.18;
+  const GROUND_RAY_EXTRA = 2.0; // extend the ground check ray a bit lower
+  const COYOTE_TIME = 120; // ms allowance to jump shortly after leaving ground
+  let lastGroundedMs = 0;
       let jumpHeld = false; // key-latching
       let groundedCached = false;
+      let groundRayLine = null; // debug line for grounded ray
+      let lastGroundedLog = 0;
       function isGrounded(){
-        const ray = new BABYLON.Ray(camera.position, new BABYLON.Vector3(0,-1,0), camera.ellipsoid.y + GROUND_EPS + 0.05);
-        const pick = scene.pickWithRay(ray, m => m && m.checkCollisions === true);
-        groundedCached = !!(pick && pick.hit);
+        const origin = camera.position.clone();
+        const dir = new BABYLON.Vector3(0,-1,0);
+        const length = Math.max(3, camera.ellipsoid.y + GROUND_EPS + GROUND_RAY_EXTRA);
+        const ray = new BABYLON.Ray(origin, dir, length);
+        const pick = scene.pickWithRay(
+          ray,
+          m => !!m && (m.checkCollisions === true || m.name === 'ground' || (m.metadata && m.metadata.isChunk))
+        );
+        const hit = !!(pick && pick.hit);
+        groundedCached = hit;
+        if (groundedCached) lastGroundedMs = performance.now();
+
+        // Debug line: reuse/update an instance to avoid allocations
+        const p2 = origin.add(dir.scale(length));
+        if (!groundRayLine) {
+          groundRayLine = BABYLON.MeshBuilder.CreateLines("groundRay", { points: [origin, p2] }, scene);
+          groundRayLine.isPickable = false;
+          groundRayLine.alwaysSelectAsActiveMesh = true;
+        } else {
+          BABYLON.MeshBuilder.CreateLines("groundRay", { points: [origin, p2], instance: groundRayLine });
+        }
+        groundRayLine.color = hit ? new BABYLON.Color3(0,1,0) : new BABYLON.Color3(1,0,0);
+
+        // Throttled console message on hit
+        const now = performance.now();
+  if (hit && (now - lastGroundedLog) > 300) {
+          console.log("Ground ray hit at:", pick.pickedPoint);
+          lastGroundedLog = now;
+        }
         return groundedCached;
       }
       function toggleFly() {
@@ -503,10 +546,11 @@
           if (kbInfo.event.code === 'KeyF') toggleFly();
           if (kbInfo.event.code === 'KeyP') camera.position.copyFrom(findSafeSpawn(camera.position.x, camera.position.z));
           if (kbInfo.event.code === 'KeyR') window.location.reload();
-          if (kbInfo.event.code === 'Space') {
+      if (kbInfo.event.code === 'Space') {
             jumpHeld = true;
             if (!canFly) {
-              if (isGrounded()) {
+        const now = performance.now();
+        if (isGrounded() || (now - lastGroundedMs) < COYOTE_TIME) {
                 vVel = JUMP_SPEED; // start jump
               }
             } else {
