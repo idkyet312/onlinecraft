@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Minecraft-like with Babylon.js</title>
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.babylonjs.com/materialsLibrary/babylon.waterMaterial.min.js"></script>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    #renderCanvas { width: 100%; height: 100%; touch-action: none; }
+    #hud { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.45); color: #fff; padding: 8px 10px; border-radius: 6px; font-family: system-ui, Arial, sans-serif; font-size: 13px; line-height: 1.4; }
+  #crosshair { position: absolute; top: 50%; left: 50%; width: 16px; height: 16px; transform: translate(-50%, -50%); pointer-events: none; }
+    #crosshair::before, #crosshair::after { content: ""; position: absolute; background: rgba(255,255,255,0.9); }
+    #crosshair::before { left: 7px; top: 0; width: 2px; height: 16px; }
+    #crosshair::after { top: 7px; left: 0; height: 2px; width: 16px; }
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+  <div id="hud">
+    <div><strong>Controls</strong></div>
+  <div>W/A/S/D: Move • Mouse: Look • Left click: Break • Right click: Place</div>
+  <div>Shift: Sprint • Space: Hop • F: Toggle fly • P: Respawn • R: Reset</div>
+  <div>1-7: Block [1 Grass, 2 Dirt, 3 Stone, 4 Sand, 5 Snow, 6 Wood, 7 Leaves] • K: Save • L: Load • C: Clear</div>
+  <div id="sel">Placing: Grass</div>
+  </div>
+  <div id="crosshair"></div>
+
+  <script>
+    const canvas = document.getElementById("renderCanvas");
+    const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true, disableWebGL2Support: false });
+
+    function createScene() {
+      const scene = new BABYLON.Scene(engine);
+      scene.clearColor = new BABYLON.Color4(0.6, 0.8, 1.0, 1);
+
+      // Camera: First-person
+      const camera = new BABYLON.UniversalCamera("fpCam", new BABYLON.Vector3(0, 0, 0), scene);
+      camera.attachControl(canvas, true);
+      camera.minZ = 0.1;
+      camera.speed = 0.35;
+      camera.angularSensibility = 3000; // lower = faster
+      camera.keysUp.push(87);   // W
+      camera.keysLeft.push(65); // A
+      camera.keysDown.push(83); // S
+      camera.keysRight.push(68);// D
+
+  // Collisions + our own gravity (we'll manage jump arc manually)
+      scene.collisionsEnabled = true;
+      camera.checkCollisions = true;
+  camera.applyGravity = false; // we'll drive vertical motion ourselves
+      camera.ellipsoid = new BABYLON.Vector3(0.4, 0.9, 0.4);
+  scene.gravity = new BABYLON.Vector3(0, -0.15, 0);
+
+      const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0.5, 1, 0.3), scene);
+      light.intensity = 0.95;
+
+      // -------- Texture atlas (procedural) and block base meshes --------
+      const TILE = 32, COLS = 4, ROWS = 4;
+      const atlasDT = new BABYLON.DynamicTexture("atlas", { width: TILE*COLS, height: TILE*ROWS }, scene, false);
+      const ctx = atlasDT.getContext();
+      function drawTile(ix, colorFn) {
+        const x = (ix % COLS) * TILE; const y = Math.floor(ix / COLS) * TILE;
+        ctx.save(); ctx.translate(x,y);
+        colorFn(ctx);
+        ctx.restore();
+      }
+      function noise(ctx, w, h, alpha=18) {
+        const img = ctx.getImageData(0,0,w,h);
+        for (let i=0; i<img.data.length; i+=4) {
+          const n = (Math.random()*alpha - alpha/2);
+          img.data[i]   = Math.min(255, Math.max(0, img.data[i]   + n));
+          img.data[i+1] = Math.min(255, Math.max(0, img.data[i+1] + n));
+          img.data[i+2] = Math.min(255, Math.max(0, img.data[i+2] + n));
+        }
+        ctx.putImageData(img,0,0);
+      }
+      function fill(ctx, col) { ctx.fillStyle = col; ctx.fillRect(0,0,TILE,TILE); }
+      // Tile indices
+      const TILE_GRASS_TOP = 0;
+      const TILE_GRASS_SIDE = 1;
+      const TILE_DIRT = 2;
+      const TILE_STONE = 3;
+      const TILE_SAND = 4;
+  const TILE_SNOW = 5;
+  const TILE_WOOD = 6;
+  const TILE_LEAVES = 7;
+      // Draw tiles
+      drawTile(TILE_GRASS_TOP, (c)=>{ fill(c, '#63e16c'); noise(c, TILE, TILE, 10); });
+      drawTile(TILE_GRASS_SIDE,(c)=>{
+        // Dirt body with a thin green stripe at the top
+        fill(c, '#8d6e63');
+        c.fillStyle = '#8d6e63';
+        c.fillRect(0, 0, TILE, Math.max(3, Math.floor(TILE*0.12)));
+        noise(c, TILE, TILE, 12);
+      });
+      drawTile(TILE_DIRT,      (c)=>{ fill(c, '#8d6e63'); noise(c, TILE, TILE, 14); });
+      drawTile(TILE_STONE,     (c)=>{ fill(c, '#9e9e9e'); noise(c, TILE, TILE, 14); });
+      drawTile(TILE_SAND,      (c)=>{ fill(c, '#f5e0a3'); noise(c, TILE, TILE, 8);  });
+  drawTile(TILE_SNOW,      (c)=>{ fill(c, '#e8f4ff'); noise(c, TILE, TILE, 6);  });
+  drawTile(TILE_WOOD,      (c)=>{ fill(c, '#8d6e3b'); c.fillStyle = '#6d4c2b'; for(let y=2;y<TILE;y+=6){ c.fillRect(0,y,TILE,2); } noise(c, TILE, TILE, 10); });
+  drawTile(TILE_LEAVES,    (c)=>{ fill(c, '#5dbb63'); c.fillStyle='#4aa853'; for(let i=0;i<28;i++){ c.fillRect((Math.random()*TILE)|0,(Math.random()*TILE)|0,2,2);} noise(c, TILE, TILE, 12); });
+      atlasDT.update();
+      const atlasTex = atlasDT;
+      atlasTex.hasAlpha = false;
+      atlasTex.updateSamplingMode(BABYLON.Texture.NEAREST_SAMPLINGMODE);
+      const atlasMat = new BABYLON.StandardMaterial('atlasMat', scene);
+      atlasMat.diffuseTexture = atlasTex;
+      atlasMat.specularColor = new BABYLON.Color3(0,0,0);
+      // Helper to compute face UV for a given tile index
+      function tileUV(ix){
+        const u0 = (ix % COLS)/COLS; const u1 = u0 + 1/COLS;
+        const rowTop = Math.floor(ix/COLS); // 0 is top row in canvas, need flip V
+        const v1 = 1 - (rowTop)/ROWS;      // top edge
+        const v0 = v1 - 1/ROWS;            // bottom edge
+        return new BABYLON.Vector4(u0, v0, u1, v1);
+      }
+      function faceUVAll(ix){ return [tileUV(ix), tileUV(ix), tileUV(ix), tileUV(ix), tileUV(ix), tileUV(ix)]; }
+      function faceUVGrass(){
+        // order: front, back, right, left, top, bottom
+        const side = tileUV(TILE_GRASS_SIDE);
+        const top  = tileUV(TILE_GRASS_TOP);
+        const dirt = tileUV(TILE_DIRT);
+        return [side, side, side, side, top, dirt];
+      }
+      // Base meshes per block type
+      const baseMeshes = {};
+      baseMeshes.grass = BABYLON.MeshBuilder.CreateBox('base_grass', { size:1, faceUV: faceUVGrass() }, scene);
+      baseMeshes.dirt  = BABYLON.MeshBuilder.CreateBox('base_dirt',  { size:1, faceUV: faceUVAll(TILE_DIRT) }, scene);
+      baseMeshes.stone = BABYLON.MeshBuilder.CreateBox('base_stone', { size:1, faceUV: faceUVAll(TILE_STONE) }, scene);
+  baseMeshes.sand  = BABYLON.MeshBuilder.CreateBox('base_sand',  { size:1, faceUV: faceUVAll(TILE_SAND) }, scene);
+  baseMeshes.snow  = BABYLON.MeshBuilder.CreateBox('base_snow',  { size:1, faceUV: faceUVAll(TILE_SNOW) }, scene);
+  baseMeshes.wood  = BABYLON.MeshBuilder.CreateBox('base_wood',  { size:1, faceUV: faceUVAll(TILE_WOOD) }, scene);
+  baseMeshes.leaves= BABYLON.MeshBuilder.CreateBox('base_leaves',{ size:1, faceUV: faceUVAll(TILE_LEAVES) }, scene);
+      for (const k in baseMeshes){ baseMeshes[k].material = atlasMat; baseMeshes[k].isVisible = false; baseMeshes[k].checkCollisions = true; }
+
+      // World settings
+  const SIZE_X = 32; // x size (columns)
+  const SIZE_Z = 32; // z size (rows)
+  const MAX_H  = 18; // max height
+      const SEA_LVL = 8;
+
+  const clamp = (v,min,max) => Math.max(min, Math.min(max, v));
+
+      // Heightmap function (simple layered sines for speed; no external libs)
+      function hmap(x, z) {
+        const f1 = 0.12, f2 = 0.045, f3 = 0.02;
+        const n = Math.sin(x*f1) * 2 + Math.cos(z*f1) * 2
+                + Math.sin((x+z)*f2) * 3
+                + Math.cos((x-z)*f3) * 4;
+        const h = SEA_LVL + Math.round(n * 0.9 + 4);
+        return Math.max(1, Math.min(MAX_H, h));
+      }
+
+      // Simple biome values using low-frequency fields
+      function biomeAt(x,z,h){
+        const tf = 0.02, mf = 0.018;
+        const temp = 0.5 + 0.5*Math.sin(x*tf) * Math.cos(z*tf);
+        const moist = 0.5 + 0.5*Math.cos(x*mf) * Math.sin(z*mf);
+        const alt = h / MAX_H;
+        // Snow at high/cold; sand near sea/low moisture; else grass
+        if (alt > 0.75 && temp < 0.5) return 'snow';
+        if (h <= SEA_LVL + 1 && moist < 0.45) return 'sand';
+        return 'grass';
+      }
+
+      // BlockType enum
+  const BlockType = { grass:1, dirt:2, stone:3, sand:4, snow:5, wood:6, leaves:7 };
+  const PlaceNames = { 1:'Grass', 2:'Dirt', 3:'Stone', 4:'Sand', 5:'Snow', 6:'Wood', 7:'Leaves' };
+
+      // Store world voxels and instances
+  const key = (x,y,z) => `${x}|${y}|${z}`;
+  const vox  = new Map();      // key -> BlockType (number)
+  const heights = Array.from({length: SIZE_X}, () => new Array(SIZE_Z).fill(0));
+  // Chunking
+  const CHUNK_SIZE = 16;
+  const chunkKey = (cx,cz)=>`${cx}|${cz}`;
+  const chunkMeshes = new Map(); // key -> Mesh
+
+      function baseForType(t){
+        switch(t){
+          case BlockType.grass: return baseMeshes.grass;
+          case BlockType.dirt:  return baseMeshes.dirt;
+          case BlockType.stone: return baseMeshes.stone;
+          case BlockType.sand:  return baseMeshes.sand;
+          case BlockType.snow:  return baseMeshes.snow;
+          case BlockType.wood:  return baseMeshes.wood;
+          case BlockType.leaves:return baseMeshes.leaves;
+          default: return baseMeshes.dirt;
+        }
+      }
+
+  // Voxel getters/setters with bounds
+  function inBounds(x,y,z){ return x>=0 && x<SIZE_X && z>=0 && z<SIZE_Z && y>=0 && y<=MAX_H; }
+  function getBlock(x,y,z){ if(!inBounds(x,y,z)) return 0; const t = vox.get(key(x,y,z)); return t||0; }
+  function setBlock(x,y,z,t){ if(!inBounds(x,y,z)) return; const k = key(x,y,z); if(!t){ vox.delete(k);} else { vox.set(k,t);} }
+  function recomputeColumnHeight(x,z){ let top=0; for(let y=MAX_H;y>=0;y--){ if(getBlock(x,y,z)){ top=y; break; } } heights[x][z]=top; }
+
+      // Meshing helpers
+      function tileForFace(t, face){ // face: 0=front,1=back,2=right,3=left,4=top,5=bottom
+        switch(t){
+          case BlockType.grass:
+            if (face===4) return TILE_GRASS_TOP; // top
+            if (face===5) return TILE_DIRT;      // bottom
+            return TILE_GRASS_SIDE;              // sides
+          case BlockType.dirt:  return TILE_DIRT;
+          case BlockType.stone: return TILE_STONE;
+          case BlockType.sand:  return TILE_SAND;
+          case BlockType.snow:  return TILE_SNOW;
+          case BlockType.wood:  return TILE_WOOD;
+          case BlockType.leaves:return TILE_LEAVES;
+          default: return TILE_DIRT;
+        }
+      }
+      function getFaceUV(ix){ return tileUV(ix); }
+
+      function buildChunkMesh(cx,cz){
+        const startX = cx*CHUNK_SIZE;
+        const startZ = cz*CHUNK_SIZE;
+        const sizeX = Math.min(CHUNK_SIZE, SIZE_X - startX);
+        const sizeZ = Math.min(CHUNK_SIZE, SIZE_Z - startZ);
+        const sizeY = MAX_H+1;
+        const positions=[]; const normals=[]; const uvs=[]; const indices=[];
+        let indexOffset=0;
+        function uvRectFromTile(ix){ const v = getFaceUV(ix); return {x:v.x, y:v.y, z:v.z, w:v.w}; }
+        function pushFace(wx,wy,wz, face){
+          // wx,wy,wz are block centers in world coords
+          const half=0.5;
+          let a,b,c,d,nrm,uvRect;
+          const t = getBlock(wx,wy,wz);
+          uvRect = uvRectFromTile(tileForFace(t, face));
+          // Ensure grass uses top/bottom tiles correctly even if face id mismatches
+          if (t === BlockType.grass && (face===4 || face===5)) {
+            const isTop = (nrm && nrm[1] > 0);
+            uvRect = uvRectFromTile(isTop ? TILE_GRASS_TOP : TILE_DIRT);
+          }
+          switch(face){
+            case 2: // right +X
+              nrm=[1,0,0];
+              a=[wx+half, wy-half, wz-half];
+              b=[wx+half, wy-half, wz+half];
+              c=[wx+half, wy+half, wz+half];
+              d=[wx+half, wy+half, wz-half];
+              break;
+            case 3: // left -X
+              nrm=[-1,0,0];
+              a=[wx-half, wy-half, wz+half];
+              b=[wx-half, wy-half, wz-half];
+              c=[wx-half, wy+half, wz-half];
+              d=[wx-half, wy+half, wz+half];
+              break;
+            case 4: // top +Y
+              nrm=[0,1,0];
+              a=[wx-half, wy+half, wz-half];
+              b=[wx+half, wy+half, wz-half];
+              c=[wx+half, wy+half, wz+half];
+              d=[wx-half, wy+half, wz+half];
+              break;
+            case 5: // bottom -Y
+              nrm=[0,-1,0];
+              a=[wx-half, wy-half, wz+half];
+              b=[wx+half, wy-half, wz+half];
+              c=[wx+half, wy-half, wz-half];
+              d=[wx-half, wy-half, wz-half];
+              break;
+            case 0: // front +Z
+              nrm=[0,0,1];
+              a=[wx-half, wy-half, wz+half];
+              b=[wx-half, wy+half, wz+half];
+              c=[wx+half, wy+half, wz+half];
+              d=[wx+half, wy-half, wz+half];
+              break;
+            case 1: // back -Z
+              nrm=[0,0,-1];
+              a=[wx+half, wy-half, wz-half];
+              b=[wx+half, wy+half, wz-half];
+              c=[wx-half, wy+half, wz-half];
+              d=[wx-half, wy-half, wz-half];
+              break;
+          }
+          positions.push(...a,...b,...c,...d);
+          for(let i=0;i<4;i++){ normals.push(nrm[0],nrm[1],nrm[2]); }
+          const [u0,v0,u1,v1] = [uvRect.x, uvRect.y, uvRect.z, uvRect.w];
+          // Match vertex order per face so grass stripe sits at the top edge of the side quads
+          uvs.push(u0,v1, u1,v1, u1,v0, u0,v0);
+          indices.push(indexOffset, indexOffset+1, indexOffset+2, indexOffset, indexOffset+2, indexOffset+3);
+          indexOffset+=4;
+        }
+        for(let lx=0; lx<sizeX; lx++){
+          for(let lz=0; lz<sizeZ; lz++){
+            for(let y=0; y<sizeY; y++){
+              const wx = startX + lx, wz = startZ + lz, wy = y;
+              const t = getBlock(wx,wy,wz);
+              if (!t) continue;
+              // Check neighbors; if empty, emit that face
+              if (!getBlock(wx+1,wy,wz)) pushFace(wx,wy,wz,2);
+              if (!getBlock(wx-1,wy,wz)) pushFace(wx,wy,wz,3);
+              if (!getBlock(wx,wy+1,wz)) pushFace(wx,wy,wz,4);
+              if (!getBlock(wx,wy-1,wz)) pushFace(wx,wy,wz,5);
+              if (!getBlock(wx,wy,wz+1)) pushFace(wx,wy,wz,0);
+              if (!getBlock(wx,wy,wz-1)) pushFace(wx,wy,wz,1);
+            }
+          }
+        }
+        // Create or update mesh
+        const ck = chunkKey(cx,cz);
+        const old = chunkMeshes.get(ck);
+        if (old) old.dispose();
+        const mesh = new BABYLON.Mesh(`chunk_${cx}_${cz}`, scene);
+        const vd = new BABYLON.VertexData();
+        vd.positions = positions; vd.normals = normals; vd.uvs = uvs; vd.indices = indices;
+        vd.applyToMesh(mesh);
+        mesh.material = atlasMat;
+        mesh.checkCollisions = true;
+        mesh.metadata = { isChunk:true, cx, cz };
+        chunkMeshes.set(ck, mesh);
+      }
+      function rebuildChunksAround(x,z){
+        const cx = Math.floor(x/CHUNK_SIZE), cz = Math.floor(z/CHUNK_SIZE);
+        const targets = new Set([chunkKey(cx,cz)]);
+        if (x % CHUNK_SIZE === 0) targets.add(chunkKey(cx-1,cz));
+        if (x % CHUNK_SIZE === CHUNK_SIZE-1) targets.add(chunkKey(cx+1,cz));
+        if (z % CHUNK_SIZE === 0) targets.add(chunkKey(cx,cz-1));
+        if (z % CHUNK_SIZE === CHUNK_SIZE-1) targets.add(chunkKey(cx,cz+1));
+        for(const k of targets){ const [scx,scz]=k.split('|').map(Number); if (scx>=0 && scz>=0 && scx*CHUNK_SIZE<SIZE_X && scz*CHUNK_SIZE<SIZE_Z) buildChunkMesh(scx,scz); }
+      }
+      function buildAllChunks(){
+        const nx = Math.ceil(SIZE_X/CHUNK_SIZE), nz = Math.ceil(SIZE_Z/CHUNK_SIZE);
+        for(let cx=0; cx<nx; cx++) for(let cz=0; cz<nz; cz++) buildChunkMesh(cx,cz);
+      }
+
+      // Generate terrain data (or load from save)
+      function generateTerrain(){
+        for (let x=0; x<SIZE_X; x++) {
+          for (let z=0; z<SIZE_Z; z++) {
+            const h = hmap(x,z);
+            heights[x][z] = h;
+            const topType = biomeAt(x,z,h);
+            for (let y=0; y<=h; y++) {
+              let t = BlockType.dirt;
+              if (y === h) {
+                t = (topType==='grass')? BlockType.grass : (topType==='sand'? BlockType.sand : BlockType.snow);
+              } else if (h - y > 3) {
+                t = BlockType.stone;
+              } else {
+                t = BlockType.dirt;
+              }
+              vox.set(key(x,y,z), t);
+            }
+          }
+        }
+      }
+
+      function generateTrees(){
+        // Simple random trees on grass above sea level
+        for (let x=2; x<SIZE_X-2; x++) {
+          for (let z=2; z<SIZE_Z-2; z++) {
+            const topY = heights[x][z];
+            const topK = key(x, topY, z);
+            const topType = vox.get(topK);
+            if (topY <= SEA_LVL+1) continue;
+            if (topType !== BlockType.grass) continue;
+            if (Math.random() < 0.035) {
+              // Trunk
+              const h = 3 + Math.floor(Math.random()*3); // 3..5
+              for (let dy=1; dy<=h && topY+dy<=MAX_H; dy++) {
+                vox.set(key(x, topY+dy, z), BlockType.wood);
+              }
+              const leafBase = topY + h;
+              // Leaves blob
+              for (let dx=-2; dx<=2; dx++) {
+                for (let dy=-2; dy<=2; dy++) {
+                  for (let dz=-2; dz<=2; dz++) {
+                    const ax=x+dx, ay=leafBase+dy, az=z+dz;
+                    if (ax<0||ax>=SIZE_X||az<0||az>=SIZE_Z||ay<0||ay>MAX_H) continue;
+                    const dist = Math.abs(dx)+Math.abs(dy)+Math.abs(dz);
+                    if (dist <= 3 && !(dx===0 && dz===0 && dy<0)) {
+                      const kk = key(ax,ay,az);
+                      if (!vox.get(kk)) vox.set(kk, BlockType.leaves);
+                    }
+                  }
+                }
+              }
+              heights[x][z] = Math.min(MAX_H, leafBase+2);
+            }
+          }
+        }
+      }
+
+      function instantiateExposed(){
+        buildAllChunks();
+      }
+
+      // Big ground plane under the world to catch falls
+  const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 200, height: 200 }, scene);
+      ground.position.y = -2;
+      ground.checkCollisions = true;
+      const matGround = new BABYLON.StandardMaterial("mGround", scene); matGround.diffuseColor = new BABYLON.Color3(0.2,0.5,0.2); matGround.alpha = 0.9;
+      ground.material = matGround;
+
+      // Water plane at sea level using WaterMaterial (waves/refraction)
+      const water = BABYLON.MeshBuilder.CreateGround('water', { width: 300, height: 300 }, scene);
+      water.position.y = SEA_LVL + 0.5;
+      let waterMat;
+      try {
+        waterMat = new BABYLON.WaterMaterial('mWater', scene, new BABYLON.Vector2(512,512));
+        waterMat.bumpTexture = new BABYLON.Texture('https://assets.babylonjs.com/textures/waterbump.png', scene);
+        waterMat.windForce = -8;
+        waterMat.waveHeight = 0.2;
+        waterMat.bumpHeight = 0.15;
+        waterMat.waveLength = 0.15;
+        waterMat.colorBlendFactor = 0.25;
+        waterMat.alpha = 0.8;
+        water.material = waterMat;
+      } catch(err) {
+        const fallback = new BABYLON.StandardMaterial('mWater', scene);
+        fallback.diffuseColor = new BABYLON.Color3(0.43, 0.76, 1.0);
+        fallback.alpha = 0.45;
+        fallback.specularColor = new BABYLON.Color3(0,0,0);
+        water.material = fallback;
+      }
+      water.checkCollisions = false;
+
+      // Safe spawn helper
+      function findSafeSpawn(cx = Math.floor(SIZE_X/2), cz = Math.floor(SIZE_Z/2)) {
+        const sx = clamp(Math.floor(cx), 0, SIZE_X-1);
+        const sz = clamp(Math.floor(cz), 0, SIZE_Z-1);
+        const sy = heights[sx][sz] + 2;
+        return new BABYLON.Vector3(sx + 0.5, sy, sz + 0.5);
+      }
+  // Camera spawn will be set after world is generated/loaded
+
+      // Utility: after removing a block, neighbors that were internal may be exposed -> instantiate them
+      function revealNewlyExposedNeighbors(x,y,z) {
+        // With chunk meshing we just rebuild affected chunks
+        rebuildChunksAround(x,z);
+      }
+
+      // Save / Load to localStorage
+      const SAVE_KEY = 'voxelWorld_v1';
+      function saveWorld(){
+        const arr = [];
+        vox.forEach((t,kstr)=>{
+          const [xs,ys,zs] = kstr.split('|');
+          arr.push([parseInt(xs), parseInt(ys), parseInt(zs), t]);
+        });
+        const payload = { size:[SIZE_X,SIZE_Z,MAX_H], vox: arr };
+        localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
+      }
+  function clearInstances(){ chunkMeshes.forEach((m)=>{ if(m) m.dispose(); }); chunkMeshes.clear(); }
+      function clearVox(){ vox.clear(); }
+      function rebuildHeightsFromVox(){
+        for (let x=0; x<SIZE_X; x++) {
+          for (let z=0; z<SIZE_Z; z++) {
+            let top = 0;
+            for (let y=MAX_H; y>=0; y--) { if (vox.get(key(x,y,z))) { top=y; break; } }
+            heights[x][z] = top;
+          }
+        }
+      }
+      function loadWorld(){
+        const s = localStorage.getItem(SAVE_KEY);
+        if (!s) return false;
+        try {
+          const data = JSON.parse(s);
+          clearInstances();
+          clearVox();
+          for (const [x,y,z,t] of data.vox) { vox.set(key(x,y,z), t); }
+          rebuildHeightsFromVox();
+          instantiateExposed();
+          return true;
+        } catch(e) { console.warn('Load failed', e); return false; }
+      }
+      let saveTimer = null; function scheduleSave(){ clearTimeout(saveTimer); saveTimer = setTimeout(saveWorld, 250); }
+
+      // Ray picking for break/place
+  let canFly = false;
+      // Physics-based vertical motion
+      let vVel = 0; // vertical velocity (units/s)
+      const GRAVITY = -24; // units/s^2
+      const JUMP_SPEED = 6.5; // initial jump speed (units/s)
+      const GROUND_EPS = 0.15;
+      let jumpHeld = false; // key-latching
+      let groundedCached = false;
+      function isGrounded(){
+        const ray = new BABYLON.Ray(camera.position, new BABYLON.Vector3(0,-1,0), camera.ellipsoid.y + GROUND_EPS + 0.05);
+        const pick = scene.pickWithRay(ray, m => m && m.checkCollisions === true);
+        groundedCached = !!(pick && pick.hit);
+        return groundedCached;
+      }
+      function toggleFly() {
+        canFly = !canFly;
+        // in fly mode we ignore gravity and vertical velocity
+        if (canFly) vVel = 0;
+      }
+
+      scene.onKeyboardObservable.add((kbInfo) => {
+        if (kbInfo.type === BABYLON.KeyboardEventTypes.KEYDOWN) {
+          if (kbInfo.event.code === 'ShiftLeft' || kbInfo.event.code === 'ShiftRight') {
+            camera.speed = 0.7;
+          }
+          if (kbInfo.event.code === 'KeyF') toggleFly();
+          if (kbInfo.event.code === 'KeyP') camera.position.copyFrom(findSafeSpawn(camera.position.x, camera.position.z));
+          if (kbInfo.event.code === 'KeyR') window.location.reload();
+          if (kbInfo.event.code === 'Space') {
+            jumpHeld = true;
+            if (!canFly) {
+              if (isGrounded()) {
+                vVel = JUMP_SPEED; // start jump
+              }
+            } else {
+              // fly up nudge
+              camera.cameraDirection.y += 0.3;
+            }
+          }
+        } else if (kbInfo.type === BABYLON.KeyboardEventTypes.KEYUP) {
+          if (kbInfo.event.code === 'ShiftLeft' || kbInfo.event.code === 'ShiftRight') {
+            camera.speed = 0.35;
+          }
+          if (kbInfo.event.code === 'Space') {
+            jumpHeld = false;
+            // optional short-hop: cut velocity if ascending
+            if (vVel > 2.5) vVel = 2.5;
+          }
+        }
+      });
+
+      // Prevent context menu on right click
+      canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // Block selection & label
+  let currentPlace = BlockType.grass;
+  const selEl = document.getElementById('sel');
+  function updateSel(){ selEl.textContent = `Placing: ${PlaceNames[currentPlace]}`; }
+  updateSel();
+
+      const MAX_REACH = 8; // how far you can interact
+
+      scene.onPointerObservable.add((pointerInfo) => {
+        if (pointerInfo.type !== BABYLON.PointerEventTypes.POINTERDOWN) return;
+        const evt = pointerInfo.event;
+        // Always pick from exact screen center using the camera's forward ray
+        const ray = camera.getForwardRay(MAX_REACH);
+        const pick = scene.pickWithRay(ray, m => m && m.metadata && m.metadata.isChunk);
+        if (!pick || !pick.hit || !pick.pickedMesh) return;
+
+        // Compute voxel coordinates from picked point and face normal
+        const n = pick.getNormal(true);
+        const p = pick.pickedPoint;
+        if (!n || !p) return;
+        // Break target: move slightly into the block along -normal; Place target: +normal
+        const hitBreak = new BABYLON.Vector3(p.x - n.x*0.001, p.y - n.y*0.001, p.z - n.z*0.001);
+        const hitPlace = new BABYLON.Vector3(p.x + n.x*0.001, p.y + n.y*0.001, p.z + n.z*0.001);
+        const roundV3 = (v)=>({ x: Math.round(v.x), y: Math.round(v.y), z: Math.round(v.z) });
+        const bp = roundV3(hitBreak);
+        const pp = roundV3(hitPlace);
+
+        const isRightClick = (evt.button === 2);
+        if (!isRightClick) {
+          // BREAK block
+          if (!inBounds(bp.x,bp.y,bp.z)) return;
+          const k = key(bp.x,bp.y,bp.z);
+          if (!vox.get(k)) return;
+          vox.delete(k);
+          recomputeColumnHeight(bp.x,bp.z);
+          revealNewlyExposedNeighbors(bp.x,bp.y,bp.z);
+          scheduleSave();
+        } else {
+          // PLACE block adjacent along face normal
+          if (!inBounds(pp.x,pp.y,pp.z)) return;
+          const tk = key(pp.x,pp.y,pp.z);
+          if (vox.get(tk)) return; // occupied
+          vox.set(tk, currentPlace);
+          recomputeColumnHeight(pp.x,pp.z);
+          rebuildChunksAround(pp.x,pp.z);
+          scheduleSave();
+        }
+      });
+
+      // Lock pointer on click for better FPS look
+      canvas.addEventListener('click', () => {
+        if (document.pointerLockElement !== canvas) {
+          canvas.requestPointerLock?.();
+        }
+      });
+
+      // Simple skybox effect via environment
+  const env = scene.createDefaultEnvironment({
+        createSkybox: true,
+        enableGroundShadow: false,
+        skyboxSize: 200,
+        skyboxColor: new BABYLON.Color3(0.5,0.7,1.0)
+      });
+      if (env && env.ground) { env.ground.dispose(); }
+
+      // Per-frame physics & auto-respawn
+      scene.onBeforeRenderObservable.add(() => {
+        const dt = engine.getDeltaTime() / 1000; // seconds
+        if (!canFly) {
+          // refresh grounded state (only if moving down or very close)
+          const wasGrounded = groundedCached;
+          const nowGrounded = isGrounded();
+          if (nowGrounded && vVel < 0) vVel = 0; // landed
+          // apply gravity
+          vVel += GRAVITY * dt;
+          // integrate vertical motion via cameraDirection
+          camera.cameraDirection.y += vVel * dt;
+        }
+        if (camera.position.y < -2) {
+          camera.position.copyFrom(findSafeSpawn(camera.position.x, camera.position.z));
+          vVel = 0;
+        }
+        // If water material exists, ensure environment is in render list for reflections
+        if (typeof waterMat !== 'undefined' && waterMat && waterMat.addToRenderList) {
+          // add skybox if present
+          const sky = scene.getMeshByName('BackgroundSkybox') || (scene.environmentTexture ? scene.activeCamera : null);
+        }
+      });
+
+      // Initial world: load if present, else generate
+      if (!loadWorld()) {
+        generateTerrain();
+        generateTrees();
+        instantiateExposed();
+      }
+      // Now that heights are valid, place camera safely
+      camera.position.copyFrom(findSafeSpawn(camera.position.x, camera.position.z));
+
+      // Global keyboard for save/load & selection (scoped to this scene)
+      window.addEventListener('keydown', (e)=>{
+        switch(e.code){
+          case 'Digit1': currentPlace = 1; updateSel(); break;
+          case 'Digit2': currentPlace = 2; updateSel(); break;
+          case 'Digit3': currentPlace = 3; updateSel(); break;
+          case 'Digit4': currentPlace = 4; updateSel(); break;
+          case 'Digit5': currentPlace = 5; updateSel(); break;
+          case 'Digit6': currentPlace = 6; updateSel(); break;
+          case 'Digit7': currentPlace = 7; updateSel(); break;
+          case 'KeyK': saveWorld(); break;
+          case 'KeyL': loadWorld(); break;
+          case 'KeyC': localStorage.removeItem('voxelWorld_v1'); window.location.reload(); break;
+        }
+      });
+
+      return scene;
+    }
+
+    let scene = createScene();
+    engine.runRenderLoop(() => scene.render());
+  window.addEventListener("resize", () => engine.resize());
+  </script>
+</body>
+</html>
