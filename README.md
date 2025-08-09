@@ -6,9 +6,10 @@ A small Minecraft-like voxel world built with Babylon.js. Features: first-person
 
 ```powershell
 npm install
-npm run start
+# Start http server + websocket server in parallel
+npm start
 ```
-Then open http://127.0.0.1:5173 in your browser.
+Then open http://127.0.0.1:5173 in your browser. For multiplayer, append `?ws=ws://localhost:8080` to the URL.
 
 ## Controls
 - W/A/S/D: Move
@@ -28,3 +29,10 @@ Then open http://127.0.0.1:5173 in your browser.
 
 ## Deploy
 Any static host works (GitHub Pages, Netlify, Vercel). Build step not required since this is static HTML.
+
+### Itch.io (HTML5)
+- Zip your static files (at minimum `index.html`).
+- Create a new itch project → kind: HTML5, upload the zip, and set it playable in the browser.
+- Publish.
+
+Multiplayer on itch requires an external WebSocket server (this repo’s `server.js`). Host it elsewhere and launch the itch URL with `?ws=wss://your-ws-host`. Browsers require `wss://` on HTTPS pages.

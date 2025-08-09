@@ -4,10 +4,15 @@
   "private": true,
   "description": "Simple Babylon.js dev server",
   "scripts": {
-    "start": "http-server -c-1 -p 5173 .",
-    "serve": "http-server -c-1 -p 5173 ."
+    "start": "concurrently \"npm:serve\" \"npm:ws\"",
+    "serve": "http-server -c-1 -p 5173 .",
+    "ws": "node server.js"
   },
   "devDependencies": {
+    "concurrently": "^8.2.2",
     "http-server": "^14.1.1"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   }
 }

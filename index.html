@@ -24,11 +24,16 @@
   <div>Shift: Sprint • Space: Hop • F: Toggle fly • P: Respawn • R: Reset</div>
   <div>1-7: Block [1 Grass, 2 Dirt, 3 Stone, 4 Sand, 5 Snow, 6 Wood, 7 Leaves] • K: Save • L: Load • C: Clear</div>
   <div id="sel">Placing: Grass</div>
+  <div id="net" style="margin-top:6px;color:#ff9;">MP: off</div>
+  <div id="wsCtl" style="margin-top:6px;">
+    <button id="btnSetWs" style="font-size:12px; padding:4px 8px;">Set multiplayer server…</button>
+    <span id="wsHint" style="opacity:0.8; margin-left:6px;"></span>
+  </div>
   </div>
   <div id="crosshair"></div>
 
   <script>
-    const canvas = document.getElementById("renderCanvas");
+  const canvas = document.getElementById("renderCanvas");
     const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true, disableWebGL2Support: false });
 
     function createScene() {
@@ -136,11 +141,14 @@
   baseMeshes.leaves= BABYLON.MeshBuilder.CreateBox('base_leaves',{ size:1, faceUV: faceUVAll(TILE_LEAVES) }, scene);
       for (const k in baseMeshes){ baseMeshes[k].material = atlasMat; baseMeshes[k].isVisible = false; baseMeshes[k].checkCollisions = true; }
 
-      // World settings
+    // World settings
   const SIZE_X = 32; // x size (columns)
   const SIZE_Z = 32; // z size (rows)
   const MAX_H  = 18; // max height
-      const SEA_LVL = 8;
+    const SEA_LVL = 8;
+  const VIEW_DIST_CHUNKS = 3; // radius in chunks to load around the player
+  const PRELOAD_RING = 1;     // extra ring beyond view for smoother pop-in
+  const STREAM_BUDGET = 3;    // max chunks to create per frame
 
   const clamp = (v,min,max) => Math.max(min, Math.min(max, v));
 
@@ -174,6 +182,8 @@
   const key = (x,y,z) => `${x}|${y}|${z}`;
   const vox  = new Map();      // key -> BlockType (number)
   const heights = Array.from({length: SIZE_X}, () => new Array(SIZE_Z).fill(0));
+  // Additional height map for streamed columns outside the legacy grid
+  const heightsMap = new Map(); // key `${x}|${z}` -> top y
   // Chunking
   const CHUNK_SIZE = 16;
   const chunkKey = (cx,cz)=>`${cx}|${cz}`;
@@ -193,10 +203,20 @@
       }
 
   // Voxel getters/setters with bounds
-  function inBounds(x,y,z){ return x>=0 && x<SIZE_X && z>=0 && z<SIZE_Z && y>=0 && y<=MAX_H; }
+  function inBounds(x,y,z){ return y>=0 && y<=MAX_H; }
   function getBlock(x,y,z){ if(!inBounds(x,y,z)) return 0; const t = vox.get(key(x,y,z)); return t||0; }
   function setBlock(x,y,z,t){ if(!inBounds(x,y,z)) return; const k = key(x,y,z); if(!t){ vox.delete(k);} else { vox.set(k,t);} }
-  function recomputeColumnHeight(x,z){ let top=0; for(let y=MAX_H;y>=0;y--){ if(getBlock(x,y,z)){ top=y; break; } } heights[x][z]=top; }
+  function setTopHeight(x,z,top){
+    if (x>=0 && x<SIZE_X && z>=0 && z<SIZE_Z) heights[x][z] = top;
+    heightsMap.set(`${x}|${z}`, top);
+  }
+  function getTopHeight(x,z){
+    const k = `${x}|${z}`;
+    if (heightsMap.has(k)) return heightsMap.get(k);
+    if (x>=0 && x<SIZE_X && z>=0 && z<SIZE_Z) return heights[x][z];
+    return hmap(x,z);
+  }
+  function recomputeColumnHeight(x,z){ let top=0; for(let y=MAX_H;y>=0;y--){ if(getBlock(x,y,z)){ top=y; break; } } setTopHeight(x,z,top); }
 
       // Meshing helpers
       function tileForFace(t, face){ // face: 0=front,1=back,2=right,3=left,4=top,5=bottom
@@ -330,16 +350,157 @@
       }
       function rebuildChunksAround(x,z){
         const cx = Math.floor(x/CHUNK_SIZE), cz = Math.floor(z/CHUNK_SIZE);
-        const targets = new Set([chunkKey(cx,cz)]);
-        if (x % CHUNK_SIZE === 0) targets.add(chunkKey(cx-1,cz));
-        if (x % CHUNK_SIZE === CHUNK_SIZE-1) targets.add(chunkKey(cx+1,cz));
-        if (z % CHUNK_SIZE === 0) targets.add(chunkKey(cx,cz-1));
-        if (z % CHUNK_SIZE === CHUNK_SIZE-1) targets.add(chunkKey(cx,cz+1));
-        for(const k of targets){ const [scx,scz]=k.split('|').map(Number); if (scx>=0 && scz>=0 && scx*CHUNK_SIZE<SIZE_X && scz*CHUNK_SIZE<SIZE_Z) buildChunkMesh(scx,scz); }
+        const neighbors = [ [cx,cz], [cx-1,cz], [cx+1,cz], [cx,cz-1], [cx,cz+1] ];
+        for (const [nx, nz] of neighbors){ ensureChunk(nx,nz); buildChunkMesh(nx,nz); }
       }
-      function buildAllChunks(){
-        const nx = Math.ceil(SIZE_X/CHUNK_SIZE), nz = Math.ceil(SIZE_Z/CHUNK_SIZE);
-        for(let cx=0; cx<nx; cx++) for(let cz=0; cz<nz; cz++) buildChunkMesh(cx,cz);
+
+      // Deterministic PRNG for trees/features
+      function rand2(x,z){
+        let h = (x * 374761393 + z * 668265263) ^ 0x5bf03635;
+        h = (h ^ (h >>> 13)) * 1274126177;
+        h ^= h >>> 16;
+        return (h >>> 0) / 4294967295;
+      }
+
+      function generateChunkData(cx,cz){
+        const startX = cx*CHUNK_SIZE;
+        const startZ = cz*CHUNK_SIZE;
+        for (let lx=0; lx<CHUNK_SIZE; lx++){
+          for (let lz=0; lz<CHUNK_SIZE; lz++){
+            const x = startX + lx, z = startZ + lz;
+            const h = hmap(x,z);
+            setTopHeight(x,z,h);
+            const topType = biomeAt(x,z,h);
+            for (let y=0; y<=h; y++){
+              let t = BlockType.dirt;
+              if (y === h) {
+                t = (topType==='grass')? BlockType.grass : (topType==='sand'? BlockType.sand : BlockType.snow);
+              } else if (h - y > 3) {
+                t = BlockType.stone;
+              } else {
+                t = BlockType.dirt;
+              }
+              vox.set(key(x,y,z), t);
+            }
+            // Trees
+            if (h > SEA_LVL+1 && topType==='grass' && rand2(x,z) < 0.035){
+              const trunkH = 3 + Math.floor(rand2(x+13,z-7)*3); // 3..5
+              for (let dy=1; dy<=trunkH && h+dy<=MAX_H; dy++){
+                vox.set(key(x, h+dy, z), BlockType.wood);
+              }
+              const leafBase = h + trunkH;
+              for (let dx=-2; dx<=2; dx++){
+                for (let dy=-2; dy<=2; dy++){
+                  for (let dz=-2; dz<=2; dz++){
+                    const ax=x+dx, ay=leafBase+dy, az=z+dz;
+                    if (!inBounds(ax,ay,az)) continue;
+                    const dist = Math.abs(dx)+Math.abs(dy)+Math.abs(dz);
+                    if (dist <= 3 && !(dx===0 && dz===0 && dy<0)){
+                      const kk = key(ax,ay,az);
+                      if (!vox.get(kk)) vox.set(kk, BlockType.leaves);
+                    }
+                  }
+                }
+              }
+              setTopHeight(x,z, Math.min(MAX_H, leafBase+2));
+            }
+          }
+        }
+      }
+
+      function ensureChunk(cx,cz){
+        const ck = chunkKey(cx,cz);
+        if (!chunkMeshes.has(ck)){
+          generateChunkData(cx,cz);
+          buildChunkMesh(cx,cz);
+        }
+      }
+
+      function unloadChunk(cx,cz){
+        const ck = chunkKey(cx,cz);
+        const mesh = chunkMeshes.get(ck);
+        if (mesh){ mesh.dispose(); chunkMeshes.delete(ck); }
+        const startX = cx*CHUNK_SIZE;
+        const startZ = cz*CHUNK_SIZE;
+        for (let lx=0; lx<CHUNK_SIZE; lx++){
+          for (let lz=0; lz<CHUNK_SIZE; lz++){
+            const x = startX + lx, z = startZ + lz;
+            heightsMap.delete(`${x}|${z}`);
+            for (let y=0; y<=MAX_H; y++) vox.delete(key(x,y,z));
+          }
+        }
+      }
+
+      function chunkInViewCone(cx,cz){
+        // Simple forward cone test based on camera forward vector
+        const centerX = cx*CHUNK_SIZE + CHUNK_SIZE*0.5;
+        const centerZ = cz*CHUNK_SIZE + CHUNK_SIZE*0.5;
+        const dx = centerX - camera.position.x;
+        const dz = centerZ - camera.position.z;
+        const len = Math.hypot(dx,dz) || 1;
+        const vx = dx/len, vz = dz/len;
+        const f = camera.getForwardRay().direction; // normalized
+        const dot = vx*f.x + vz*f.z; // ignore Y
+        // Allow a fairly wide cone to avoid popping when strafing
+        return dot > 0.25; // ~75-degree half-angle
+      }
+
+      function updateVisibleChunks(px, pz){
+        const ccx = Math.floor(px/CHUNK_SIZE);
+        const ccz = Math.floor(pz/CHUNK_SIZE);
+        const keep = new Set();
+        const toCreateCore = [];
+        const toCreatePreload = [];
+
+        const maxR = VIEW_DIST_CHUNKS + PRELOAD_RING;
+        for (let r=0; r<=maxR; r++){
+          for (let dx=-r; dx<=r; dx++){
+            for (let dz=-r; dz<=r; dz++){
+              if (Math.abs(dx) !== r && Math.abs(dz) !== r) continue; // ring perimeter only
+              const cx = ccx+dx, cz = ccz+dz;
+              const ck = chunkKey(cx,cz);
+              keep.add(ck);
+              const isPreload = r > VIEW_DIST_CHUNKS;
+              const list = isPreload ? toCreatePreload : toCreateCore;
+              list.push([cx,cz]);
+            }
+          }
+        }
+
+        // Prioritize in-view chunks, then others, within budget
+        let budget = STREAM_BUDGET;
+        const enqueue = (arr)=>{
+          // Sort by distance, then favor in-cone
+          arr.sort((a,b)=>{
+            const ax = a[0]*CHUNK_SIZE + CHUNK_SIZE*0.5 - px;
+            const az = a[1]*CHUNK_SIZE + CHUNK_SIZE*0.5 - pz;
+            const bx = b[0]*CHUNK_SIZE + CHUNK_SIZE*0.5 - px;
+            const bz = b[1]*CHUNK_SIZE + CHUNK_SIZE*0.5 - pz;
+            const ad = ax*ax+az*az, bd = bx*bx+bz*bz;
+            const av = chunkInViewCone(a[0],a[1]) ? 0 : 1;
+            const bv = chunkInViewCone(b[0],b[1]) ? 0 : 1;
+            if (av !== bv) return av - bv;
+            return ad - bd;
+          });
+          for (const [cx,cz] of arr){
+            if (budget <= 0) break;
+            const ck = chunkKey(cx,cz);
+            if (!chunkMeshes.has(ck)){
+              ensureChunk(cx,cz);
+              budget--;
+            }
+          }
+        };
+        enqueue(toCreateCore);
+        enqueue(toCreatePreload);
+
+        // Unload far chunks
+        for (const ck of Array.from(chunkMeshes.keys())){
+          if (!keep.has(ck)){
+            const [ux, uz] = ck.split('|').map(Number);
+            unloadChunk(ux,uz);
+          }
+        }
       }
 
       // Generate terrain data (or load from save)
@@ -435,11 +596,12 @@
       water.checkCollisions = false;
 
       // Safe spawn helper
-      function findSafeSpawn(cx = Math.floor(SIZE_X/2), cz = Math.floor(SIZE_Z/2)) {
-        const sx = clamp(Math.floor(cx), 0, SIZE_X-1);
-        const sz = clamp(Math.floor(cz), 0, SIZE_Z-1);
-        const sy = heights[sx][sz] + 2;
-  return new BABYLON.Vector3(sx + 0.5, sy, sz + 5);
+      function findSafeSpawn(cx = 0, cz = 0) {
+        const sx = Math.floor(cx);
+        const sz = Math.floor(cz);
+        ensureChunk(Math.floor(sx/CHUNK_SIZE), Math.floor(sz/CHUNK_SIZE));
+        const sy = getTopHeight(sx,sz) + 2;
+        return new BABYLON.Vector3(sx + 0.5, sy, sz + 0.5);
       }
   // Camera spawn will be set after world is generated/loaded
 
@@ -485,6 +647,159 @@
         } catch(e) { console.warn('Load failed', e); return false; }
       }
       let saveTimer = null; function scheduleSave(){ clearTimeout(saveTimer); saveTimer = setTimeout(saveWorld, 250); }
+
+  // Multiplayer: basic WebSocket client (optional)
+      // Provide ws endpoint via any of:
+      //  - ?ws=wss://host
+      //  - #ws=wss://host
+      //  - Parent page (document.referrer) query/hash containing ws= (useful on itch.io page URL)
+      function getWsUrl(){
+        const tryParse = (raw) => {
+          if (!raw) return null;
+          try {
+            let u = new URL(raw);
+            if (location.protocol === 'https:' && u.protocol !== 'wss:') u = new URL(raw.replace(/^ws:/,'wss:'));
+            return u.toString();
+          } catch { return null; }
+        };
+        // 1) From this iframe's query
+        let url = tryParse(new URLSearchParams(location.search).get('ws'));
+        if (url) return url;
+        // 2) From this iframe's hash
+        url = tryParse(new URLSearchParams((location.hash||'').replace(/^#/,'')).get('ws'));
+        if (url) return url;
+        // 3) From parent/referrer (itch page) query or hash
+        try {
+          if (document.referrer) {
+            const ref = new URL(document.referrer);
+            url = tryParse(ref.searchParams.get('ws'));
+            if (url) return url;
+            const refHash = ref.hash ? new URLSearchParams(ref.hash.slice(1)).get('ws') : null;
+            url = tryParse(refHash);
+            if (url) return url;
+          }
+        } catch {}
+        // 4) From localStorage (manual set via UI)
+        url = tryParse(localStorage.getItem('ws_url'));
+        if (url) return url;
+        return null;
+      }
+  const wsHintEl = document.getElementById('wsHint');
+  function setWsHint(u){ wsHintEl.textContent = u ? `ws: ${u}` : ''; }
+
+  let WS_URL = getWsUrl();
+  let ws = null;
+      const others = new Map(); // id -> { mesh }
+      let myId = null;
+      const netEl = document.getElementById('net');
+      function setNet(status, detail=""){
+        if (!netEl) return;
+        let color = '#ff9';
+        if (status === 'connected') color = '#6f6';
+        else if (status === 'connecting') color = '#9cf';
+        else if (status === 'error') color = '#f66';
+        else if (status === 'disconnected') color = '#f96';
+        netEl.style.color = color;
+        const count = others.size;
+        const tail = detail ? ` • ${detail}` : '';
+        const players = (status === 'connected') ? ` • players: ${count+1}` : '';
+        netEl.textContent = WS_URL ? `MP: ${status}${players}${tail}` : 'MP: off';
+      }
+      if (!WS_URL) setNet('off'); else setNet('connecting');
+  function connectWS(){
+        if (!WS_URL) return; // single-player
+        try {
+          ws = new WebSocket(WS_URL);
+          ws.onopen = () => {
+            setNet('connected');
+            ws.send(JSON.stringify({ type:'hello', name: 'player' }));
+            // Request world edits snapshot
+            ws.send(JSON.stringify({ type:'requestWorld' }));
+          };
+          ws.onmessage = (ev) => {
+            let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+            if (!msg || typeof msg !== 'object') return;
+            switch(msg.type){
+              case 'welcome': myId = msg.id; break;
+              case 'pos': {
+                if (msg.id === myId) break;
+                let entry = others.get(msg.id);
+                if (!entry){
+                  const avatar = BABYLON.MeshBuilder.CreateCapsule('p_'+msg.id, { height: 1.7, radius: 0.4, tessellation: 12 }, scene);
+                  avatar.material = new BABYLON.StandardMaterial('pmat_'+msg.id, scene);
+                  avatar.material.diffuseColor = new BABYLON.Color3(0.9,0.8,0.2);
+                  entry = { mesh: avatar };
+                  others.set(msg.id, entry);
+                }
+                entry.mesh.position.set(msg.x, msg.y, msg.z);
+                break;
+              }
+              case 'leave': {
+                const e = others.get(msg.id);
+                if (e){ e.mesh.dispose(); others.delete(msg.id); }
+                setNet('connected');
+                break;
+              }
+              case 'block': {
+                const { x,y,z,t } = msg;
+                const k = key(x,y,z);
+                if (t) vox.set(k, t); else vox.delete(k);
+                recomputeColumnHeight(x,z);
+                rebuildChunksAround(x,z);
+                break;
+              }
+              case 'world': {
+                for (const [x,y,z,t] of msg.vox){
+                  const k = key(x,y,z);
+                  if (t) vox.set(k,t); else vox.delete(k);
+                }
+                rebuildHeightsFromVox();
+                // Rebuild visible chunks near camera
+                rebuildChunksAround(Math.floor(camera.position.x), Math.floor(camera.position.z));
+                break;
+              }
+            }
+          };
+          ws.onerror = (e) => { setNet('error'); };
+          ws.onclose = () => { setNet('disconnected'); if (WS_URL) setTimeout(connectWS, 2000); };
+        } catch {}
+      }
+      connectWS();
+
+      // Simple UI to set WS endpoint at runtime (stored in localStorage)
+      document.getElementById('btnSetWs').addEventListener('click', () => {
+        const cur = WS_URL || localStorage.getItem('ws_url') || '';
+        const v = prompt('Enter wss:// endpoint for multiplayer:', cur);
+        if (!v) return;
+        try {
+          let u = new URL(v);
+          if (location.protocol === 'https:' && u.protocol !== 'wss:') u = new URL(v.replace(/^ws:/,'wss:'));
+          const s = u.toString();
+          localStorage.setItem('ws_url', s);
+          WS_URL = s;
+          setWsHint(WS_URL);
+          // reconnect
+          if (ws && ws.readyState === WebSocket.OPEN) try { ws.close(); } catch{}
+          setNet('connecting');
+          connectWS();
+        } catch {
+          alert('Invalid URL. Expected wss://host');
+        }
+      });
+      setWsHint(WS_URL || localStorage.getItem('ws_url') || '');
+
+      // Periodically send my position/rotation (budgeted)
+      let lastPosSend = 0;
+      function sendPos(dt){
+  if (!ws || ws.readyState !== WebSocket.OPEN || !myId) return;
+        lastPosSend += dt;
+        if (lastPosSend < 0.05) return; // 20 Hz
+        lastPosSend = 0;
+        const dir = camera.getForwardRay().direction;
+        const rx = Math.atan2(dir.y, Math.hypot(dir.x, dir.z));
+        const ry = Math.atan2(dir.x, dir.z);
+        ws.send(JSON.stringify({ type:'pos', x: camera.position.x, y: camera.position.y, z: camera.position.z, rx, ry }));
+      }
 
       // Ray picking for break/place
   let canFly = false;
@@ -610,6 +925,7 @@
           recomputeColumnHeight(bp.x,bp.z);
           revealNewlyExposedNeighbors(bp.x,bp.y,bp.z);
           scheduleSave();
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'block', x:bp.x,y:bp.y,z:bp.z,t:0 }));
         } else {
           // PLACE block adjacent along face normal
           if (!inBounds(pp.x,pp.y,pp.z)) return;
@@ -619,6 +935,7 @@
           recomputeColumnHeight(pp.x,pp.z);
           rebuildChunksAround(pp.x,pp.z);
           scheduleSave();
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'block', x:pp.x,y:pp.y,z:pp.z,t:currentPlace }));
         }
       });
 
@@ -632,15 +949,63 @@
       // Simple skybox effect via environment
   const env = scene.createDefaultEnvironment({
         createSkybox: true,
-        enableGroundShadow: false,
+        enableGroundShadow: true,
         skyboxSize: 200,
         skyboxColor: new BABYLON.Color3(0.5,0.7,1.0)
       });
       if (env && env.ground) { env.ground.dispose(); }
 
+      // --- Enemies: simple ground-hugging box that chases the player ---
+      const enemies = [];
+      const enemyMat = new BABYLON.StandardMaterial("mEnemy", scene);
+      enemyMat.diffuseColor = new BABYLON.Color3(0.9, 0.2, 0.2);
+      function spawnEnemy(x, z, speed = 3.0) {
+        const ex = Math.floor(x) + 3;
+        const ez = Math.floor(z) + 3;
+        const topY = getTopHeight(Math.round(ex), Math.round(ez));
+        const mesh = BABYLON.MeshBuilder.CreateCapsule("enemy", { height: 1.5, radius: 0.5, tessellation: 12 }, scene);
+        mesh.material = enemyMat;
+        mesh.checkCollisions = true;
+        mesh.ellipsoid = new BABYLON.Vector3(0.4, 0.45, 0.4);
+        mesh.position.set(ex, topY + 1, ez);
+        enemies.push({ mesh, speed });
+        return mesh;
+      }
+      function updateEnemies(dt) {
+        if (!enemies.length) return;
+        const px = camera.position.x;
+        const pz = camera.position.z;
+        for (const e of enemies) {
+          const m = e.mesh;
+          // Direction to player on XZ
+          const dx = px - m.position.x;
+          const dz = pz - m.position.z;
+          const dist = Math.hypot(dx, dz);
+          if (dist > 0.001) {
+            const step = Math.min(dist, e.speed * dt);
+            const vx = (dx / dist) * step;
+            const vz = (dz / dist) * step;
+            // Move with collisions
+            const dv = new BABYLON.Vector3(vx, 0.3, vz);
+            if (typeof m.moveWithCollisions === "function") {
+              m.moveWithCollisions(dv);
+            } else {
+              m.position.addInPlace(dv);
+            }
+          }
+          // Keep on ground
+          const ty = getTopHeight(Math.round(m.position.x), Math.round(m.position.z));
+          // Smooth Y to avoid popping on edges
+          m.position.y += (ty + 1 - m.position.y) * Math.min(1, dt * 10);
+        }
+      }
+
       // Per-frame physics & auto-respawn
       scene.onBeforeRenderObservable.add(() => {
         const dt = engine.getDeltaTime() / 1000; // seconds
+        sendPos(dt);
+        // Stream chunks around the camera position
+        updateVisibleChunks(camera.position.x, camera.position.z);
         if (!canFly) {
           // refresh grounded state (only if moving down or very close)
           const wasGrounded = groundedCached;
@@ -657,19 +1022,21 @@
         }
         // If water material exists, ensure environment is in render list for reflections
         if (typeof waterMat !== 'undefined' && waterMat && waterMat.addToRenderList) {
-          // add skybox if present
           const sky = scene.getMeshByName('BackgroundSkybox') || (scene.environmentTexture ? scene.activeCamera : null);
         }
+        // Update enemies after chunks may have streamed
+        updateEnemies(dt);
       });
 
-      // Initial world: load if present, else generate
+      // Initial world: load if present, else start streaming
       if (!loadWorld()) {
-        generateTerrain();
-        generateTrees();
-        instantiateExposed();
+        updateVisibleChunks(0,0);
       }
       // Now that heights are valid, place camera safely
-      camera.position.copyFrom(findSafeSpawn(camera.position.x, camera.position.z));
+      camera.position.copyFrom(findSafeSpawn(0, 0));
+
+      // Spawn a test enemy near the player
+      spawnEnemy(camera.position.x + 10, camera.position.z + 5);
 
       // Global keyboard for save/load & selection (scoped to this scene)
       window.addEventListener('keydown', (e)=>{
